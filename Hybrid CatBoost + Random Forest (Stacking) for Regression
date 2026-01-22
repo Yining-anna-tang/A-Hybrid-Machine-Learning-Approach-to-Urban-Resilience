@@ -1,0 +1,260 @@
+# -*- coding: utf-8 -*-
+"""
+Hybrid CatBoost + Random Forest (Stacking) for Regression
+- Base learners: CatBoostRegressor, RandomForestRegressor
+- Meta learner: Ridge (you can switch to LinearRegression)
+- Metrics: RMSE, R2
+- Optional: SHAP interpretation for CatBoost component
+"""
+
+import os
+import joblib
+import numpy as np
+import pandas as pd
+
+from sklearn.model_selection import train_test_split, KFold, cross_val_predict
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.impute import SimpleImputer
+
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.linear_model import Ridge
+from sklearn.metrics import mean_squared_error, r2_score
+
+from catboost import CatBoostRegressor
+
+# =========================
+# 1) User settings
+# =========================
+DATA_PATH = "data.csv"       # <-- change to your file path
+TARGET_COL = "y"             # <-- change to your target column name
+ID_COLS = ["id", "year"]     # <-- columns to exclude from features (optional)
+MODEL_DIR = "models"
+RANDOM_STATE = 42
+
+os.makedirs(MODEL_DIR, exist_ok=True)
+
+# =========================
+# 2) Load data
+# =========================
+df = pd.read_csv(DATA_PATH)
+
+# Basic checks
+assert TARGET_COL in df.columns, f"TARGET_COL '{TARGET_COL}' not found in data."
+
+# Separate X and y
+drop_cols = [TARGET_COL] + [c for c in ID_COLS if c in df.columns]
+X = df.drop(columns=drop_cols, errors="ignore")
+y = df[TARGET_COL].astype(float)
+
+# Identify column types
+cat_cols = X.select_dtypes(include=["object", "category", "bool"]).columns.tolist()
+num_cols = [c for c in X.columns if c not in cat_cols]
+
+# =========================
+# 3) Preprocess (safe default)
+#    - numeric: median impute
+#    - categorical: most_frequent impute + one-hot
+# =========================
+numeric_transformer = Pipeline(steps=[
+    ("imputer", SimpleImputer(strategy="median")),
+])
+
+categorical_transformer = Pipeline(steps=[
+    ("imputer", SimpleImputer(strategy="most_frequent")),
+    ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
+])
+
+preprocess = ColumnTransformer(
+    transformers=[
+        ("num", numeric_transformer, num_cols),
+        ("cat", categorical_transformer, cat_cols),
+    ],
+    remainder="drop",
+)
+
+# =========================
+# 4) Define base learners
+# =========================
+cat_model = CatBoostRegressor(
+    loss_function="RMSE",
+    iterations=2000,
+    learning_rate=0.03,
+    depth=6,
+    l2_leaf_reg=3.0,
+    random_seed=RANDOM_STATE,
+    verbose=200,
+    # Use early stopping with eval_set in fit below
+)
+
+rf_model = RandomForestRegressor(
+    n_estimators=800,
+    max_depth=None,
+    min_samples_split=2,
+    min_samples_leaf=1,
+    max_features="auto",
+    n_jobs=-1,
+    random_state=RANDOM_STATE,
+)
+
+meta_model = Ridge(alpha=1.0, random_state=RANDOM_STATE)
+
+# =========================
+# 5) Train/test split
+# =========================
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=RANDOM_STATE
+)
+
+# =========================
+# 6) Fit preprocess on train, transform train/test
+# =========================
+X_train_p = preprocess.fit_transform(X_train)
+X_test_p = preprocess.transform(X_test)
+
+# Keep feature names after one-hot (useful later)
+feature_names = []
+if num_cols:
+    feature_names.extend(num_cols)
+if cat_cols:
+    ohe = preprocess.named_transformers_["cat"].named_steps["onehot"]
+    ohe_names = ohe.get_feature_names_out(cat_cols).tolist()
+    feature_names.extend(ohe_names)
+
+# =========================
+# 7) Build stacking (manual, robust)
+#    Step A: out-of-fold predictions for meta features
+# =========================
+kf = KFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+
+# Out-of-fold predictions for training meta-features
+# CatBoost: we fit fold-by-fold to enable early stopping
+oof_cat = np.zeros(len(y_train))
+oof_rf = np.zeros(len(y_train))
+
+X_train_p_np = np.array(X_train_p)
+y_train_np = np.array(y_train)
+
+for fold, (tr_idx, val_idx) in enumerate(kf.split(X_train_p_np), start=1):
+    X_tr, X_val = X_train_p_np[tr_idx], X_train_p_np[val_idx]
+    y_tr, y_val = y_train_np[tr_idx], y_train_np[val_idx]
+
+    # Fit CatBoost with early stopping
+    cat_fold = CatBoostRegressor(
+        loss_function="RMSE",
+        iterations=5000,
+        learning_rate=0.03,
+        depth=6,
+        l2_leaf_reg=3.0,
+        random_seed=RANDOM_STATE,
+        verbose=False,
+    )
+    cat_fold.fit(X_tr, y_tr, eval_set=(X_val, y_val), use_best_model=True, early_stopping_rounds=200)
+    oof_cat[val_idx] = cat_fold.predict(X_val)
+
+    # Fit Random Forest
+    rf_fold = RandomForestRegressor(
+        n_estimators=800,
+        max_depth=None,
+        min_samples_split=2,
+        min_samples_leaf=1,
+        max_features="auto",
+        n_jobs=-1,
+        random_state=RANDOM_STATE,
+    )
+    rf_fold.fit(X_tr, y_tr)
+    oof_rf[val_idx] = rf_fold.predict(X_val)
+
+    print(f"Fold {fold} done.")
+
+# Meta features for training
+meta_X_train = np.column_stack([oof_cat, oof_rf])
+
+# =========================
+# 8) Fit final base learners on full train
+# =========================
+# CatBoost final with early stopping using a validation split from train
+X_tr2, X_val2, y_tr2, y_val2 = train_test_split(
+    X_train_p_np, y_train_np, test_size=0.15, random_state=RANDOM_STATE
+)
+cat_model_final = CatBoostRegressor(
+    loss_function="RMSE",
+    iterations=5000,
+    learning_rate=0.03,
+    depth=6,
+    l2_leaf_reg=3.0,
+    random_seed=RANDOM_STATE,
+    verbose=200,
+)
+cat_model_final.fit(X_tr2, y_tr2, eval_set=(X_val2, y_val2), use_best_model=True, early_stopping_rounds=200)
+
+rf_model_final = RandomForestRegressor(
+    n_estimators=800,
+    max_depth=None,
+    min_samples_split=2,
+    min_samples_leaf=1,
+    max_features="auto",
+    n_jobs=-1,
+    random_state=RANDOM_STATE,
+)
+rf_model_final.fit(X_train_p_np, y_train_np)
+
+# =========================
+# 9) Fit meta learner
+# =========================
+meta_model.fit(meta_X_train, y_train_np)
+
+# =========================
+# 10) Predict on test (stacking)
+# =========================
+cat_test_pred = cat_model_final.predict(X_test_p)
+rf_test_pred = rf_model_final.predict(X_test_p)
+meta_X_test = np.column_stack([cat_test_pred, rf_test_pred])
+
+y_pred = meta_model.predict(meta_X_test)
+
+rmse = mean_squared_error(y_test, y_pred, squared=False)
+r2 = r2_score(y_test, y_pred)
+
+print("\n===== Hybrid Stacking Performance (Test) =====")
+print(f"RMSE: {rmse:.6f}")
+print(f"R2:   {r2:.6f}")
+
+# =========================
+# 11) Save everything for reproducibility
+# =========================
+bundle = {
+    "preprocess": preprocess,
+    "feature_names": feature_names,
+    "cat_model": cat_model_final,
+    "rf_model": rf_model_final,
+    "meta_model": meta_model,
+    "target_col": TARGET_COL,
+    "id_cols": ID_COLS,
+}
+
+save_path = os.path.join(MODEL_DIR, "hybrid_catboost_rf_stacking.joblib")
+joblib.dump(bundle, save_path)
+print(f"\nSaved model bundle to: {save_path}")
+
+# =========================
+# 12) Optional: SHAP for CatBoost component
+# =========================
+# Note: SHAP on CatBoost is typically most stable.
+# Uncomment if you want feature attributions.
+
+"""
+import shap
+
+# Use a small background sample for speed
+background = X_train_p_np[np.random.choice(X_train_p_np.shape[0], size=min(1000, X_train_p_np.shape[0]), replace=False)]
+explainer = shap.Explainer(cat_model_final, background)
+
+# Explain a subset of test samples
+X_explain = np.array(X_test_p)[:500]
+shap_values = explainer(X_explain)
+
+# Summary plot
+shap.summary_plot(shap_values, features=X_explain, feature_names=feature_names)
+"""
