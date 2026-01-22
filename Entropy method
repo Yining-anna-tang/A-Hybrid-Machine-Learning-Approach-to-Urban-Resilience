@@ -1,0 +1,92 @@
+// import excel "data.xlsx", firstrow clear
+// save data.dta, replace
+
+*=========================== SETTINGS TO CONFIGURE =========================== 
+// Positive indicators
+global positive_var x1 x3 x4 x5 x6 x7 x8 x9 x10
+// Negative indicators
+global negative_var x2
+*===========================================================================
+ 
+
+*===================== NO CHANGES NEEDED BELOW THIS LINE ==================== 
+
+// All indicators
+global all_var $positive_var $negative_var
+// Year range
+qui sum year
+global min_year = r(min)
+global max_year = r(max)
+
+forvalues year = $min_year / $max_year {
+    use data.dta, clear
+    keep if year == `year'
+
+    // Standardize data: positive indicators
+    foreach i in $positive_var {
+        qui sum `i'
+        gen x_`i' = (`i' - r(min)) / (r(max) - r(min))
+        replace x_`i' = 0.00001 if x_`i' == 0
+    }
+    
+    // Standardize data: negative indicators
+    foreach i in $negative_var {
+        qui sum `i'
+        gen x_`i' = (r(max) - `i') / (r(max) - r(min))
+        replace x_`i' = 0.00001 if x_`i' == 0
+    }
+
+    // Compute the proportion (share) of each indicator
+    foreach i in $all_var {
+        egen `i'_sum = sum(x_`i')
+        gen y_`i' = x_`i' / `i'_sum
+    }
+
+    // Compute information entropy for each indicator based on the shares
+    gen n = _N
+
+    foreach i in $all_var {
+        gen y_lny_`i' = y_`i' * ln(y_`i')
+    }
+
+    // Sum over observations
+    foreach i in $all_var {
+        egen y_lny_`i'_sum = sum(y_lny_`i')
+    }
+
+    // Compute entropy values for each indicator
+    foreach i in $all_var {
+        gen E_`i' = -1 / ln(n) * y_lny_`i'_sum
+    }
+
+    // Compute divergence (information utility) for each indicator
+    foreach i in $all_var {
+        gen d_`i' = 1 - E_`i'
+    }
+    
+    egen d_sum = rowtotal(d_*)
+    foreach i in $all_var {
+        gen W_`i' = d_`i' / d_sum
+    }
+    
+    // Compute weighted scores for each indicator
+    foreach i in $all_var {
+        gen Score_`i' = x_`i' * W_`i'
+    }
+    
+    egen Score = rowtotal(Score_*)
+
+    keep id year $all_var Score
+    save data_`year', replace
+}
+
+clear
+forvalues i = $min_year / $max_year {
+   append using data_`i'
+   rm data_`i'.dta
+}
+
+sort id year
+save 结果.dta, replace
+
+// The variable "Score" in the dataset is the computed composite index
