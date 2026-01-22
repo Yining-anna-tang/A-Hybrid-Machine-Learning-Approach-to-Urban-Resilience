@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Hybrid CatBoost + Random Forest (Stacking) for Regression
+Hybrid CatBoost-Random Forest (Stacking) for Regression
 - Base learners: CatBoostRegressor, RandomForestRegressor
 - Meta learner: Ridge (you can switch to LinearRegression)
 - Metrics: RMSE, R2
