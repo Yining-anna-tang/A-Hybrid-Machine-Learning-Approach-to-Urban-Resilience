@@ -35,32 +35,7 @@ SHAP for feature attribution and marginal effect interpretation
 Causal Inference:
 fsQCA to identify multiple sufficient configurations
 
-├── data/
-│   ├── raw/                 # Original city-level datasets
-│   ├── processed/           # Cleaned and harmonized panel data (2010–2021)
-│
-├── index_construction/
-│   ├── indicator_list.csv   # resilience indicators
-│   ├── weighting_methods/   # Entropy and normalization scripts
-│
-├── ml_models/
-│   ├── catboost_rf.py       # Hybrid ML model
-│   ├── model_validation.py  # RMSE, R², cross-validation
-│
-├── explainability/
-│   ├── shap_analysis.py     # SHAP value computation and plots
-│
-├── qca/
-│   ├── fsqca_calibration.do # Calibration and truth tables
-│   ├── configurations.txt  # Causal configurations
-│
-├── figures/
-│   ├── maps/
-│   ├── shap_plots/
-│
-└── README.md
-
-📊 Key Findings (Plain Language)
+📊 Key Findings
 Cities with strong institutions, redundant infrastructure, and lower social vulnerability are more resilient to shocks.
 High social stability can be achieved through different combinations of resilience conditions.
 There is no one-size-fits-all pathway to resilience.
